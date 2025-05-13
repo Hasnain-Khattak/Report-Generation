@@ -1,0 +1,980 @@
+import os
+import tempfile
+from datetime import datetime
+from docx import Document
+from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+from docx.oxml import parse_xml
+from docx.oxml.ns import nsdecls
+from docx.shared import Pt
+from dotenv import load_dotenv
+import pythoncom
+import time
+from docx import Document
+from openpyxl import load_workbook
+import re
+from reportlab.lib.pagesizes import letter
+import logging
+from .prompts import clean_audit_data
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+load_dotenv(".env")
+os.environ['OPENAI_API_KEY'] = os.getenv('OPENAI_API_KEY')
+
+
+# ------ Report Generator-------------
+class ReportGenerator:
+    # global process_list
+    # process_list = []
+
+    """Generate audit reports with evidence images and score-based checkmark placement."""
+    def __init__(self):
+        """Initialize the ReportGenerator."""
+        self.evidence_images = {}
+        self.evidence_metadata = {}  # Store score information
+        self.preprocessor = None
+        self.image_paths = []
+        self.report_images_dir = None
+        self.openai_api_key = os.getenv('OPENAI_API_KEY')
+        self.process_list = []
+    
+    def set_evidence_images(self, evidence_images, evidence_metadata=None):
+        """
+        Set the evidence images and metadata to be used in the report.
+        
+        Args:
+            evidence_images: Dictionary of evidence files and their images
+            evidence_metadata: Dictionary with score and category information
+        """
+        self.evidence_images = evidence_images
+        self.evidence_metadata = evidence_metadata or {}
+    
+    def set_preprocessor(self, preprocessor):
+        """Set the response preprocessor instance."""
+        self.preprocessor = preprocessor
+    
+    def fill_template_document(self, template_path, report_content, auditor_name=""):
+        """Fill the template document with the report content including evidence images."""
+        try:
+            # Load the template document
+            doc = Document(template_path)
+            
+            # Parse the LLM-generated content
+            content_sections = self._parse_report_content(report_content)
+            cleaned_data = clean_audit_data(report_content)
+            # logger.info(f"UNCLEANED DATA: {report_content}")
+            # logger.info(f"CLEANED SECTIONS: {content_sections}")
+            # logger.info(f"CLEANED DATA: {cleaned_data}")
+            
+            # Process the document by section type
+            self._fill_document_sections(doc, content_sections, auditor_name)
+            
+            # Insert evidence images if available
+            if self.evidence_images:
+                # Use preprocessor score data if available
+                if self.preprocessor and hasattr(self.preprocessor, 'score_data'):
+                    # logger.info(f"score preprocessor: {self.preprocessor.score_data}")
+                    self._insert_evidence_images_with_scoring(doc, self.preprocessor)
+                else:
+                    self._insert_evidence_images_with_scoring(doc)
+            
+            return doc
+        except Exception as e:
+            logger.error(f"Error filling template document: {str(e)}")
+            raise
+    
+    @staticmethod
+    def _parse_report_content(report_content):
+        """Parse the LLM content into structured sections."""
+        sections = {
+            'headers': {},  # key: header text, value: content
+            'tables': [],   # list of parsed tables
+            'paragraphs': []  # regular paragraphs
+        }
+        
+        lines = report_content.split('\n')
+        # logger.info(f"LINES: {lines}")
+        current_section = None
+        current_content = []
+        in_table = False
+        current_table = {'header': [], 'rows': []}
+        
+        for i, line in enumerate(lines):
+            line = line.strip()
+            
+            # Check for headers
+            if line.startswith('#'):
+                # Save previous section if exists
+                if current_section and current_content:
+                    sections['headers'][current_section] = '\n'.join(current_content)
+                    current_content = []
+                
+                # Extract header level and text
+                level_count = 0
+                for char in line:
+                    if char == '#':
+                        level_count += 1
+                    else:
+                        break
+                
+                current_section = line[level_count:].strip()
+                continue
+            
+            # Check for tables
+            if line.startswith('|') and '|' in line[1:]:
+                if not in_table:
+                    in_table = True
+                    current_table = {'header': [], 'rows': []}
+                    
+                    # Process header row
+                    cells = [cell.strip() for cell in line.split('|')[1:-1]]
+                    current_table['header'] = cells
+                else:
+                    # Check if this is a separator row
+                    if all(cell.strip() == '' or all(c in '-:' for c in cell) for cell in line.split('|')[1:-1]):
+                        continue
+                    
+                    # Process data row
+                    cells = [cell.strip() for cell in line.split('|')[1:-1]]
+                    current_table['rows'].append(cells)
+            
+            # End of table
+            elif in_table and not line.startswith('|'):
+                in_table = False
+                sections['tables'].append(current_table)
+                current_table = {'header': [], 'rows': []}
+                
+                # Process current line if not empty
+                if line:
+                    if current_section:
+                        current_content.append(line)
+                    else:
+                        sections['paragraphs'].append(line)
+            
+            # Regular paragraph text
+            elif not in_table and line:
+                if current_section:
+                    current_content.append(line)
+                else:
+                    sections['paragraphs'].append(line)
+        
+        # Handle any remaining content
+        if current_section and current_content:
+            sections['headers'][current_section] = '\n'.join(current_content)
+        
+        if in_table and (current_table['header'] or current_table['rows']):
+            sections['tables'].append(current_table)
+        
+        return sections
+
+    def _fill_document_sections(self, doc, content_sections, auditor_name):
+        # logger.info(f"CONTENT: {content_sections}")
+        """Fill document sections with parsed content."""
+        # Create lookup dictionary for special fields that need special handling
+        special_fields = {
+            'were risk mitigation strategies, verified as implemented and effective?': "Yes",
+            'give details': "Risk mitigation strategies were verified and found to be effective.",
+            'do the mitigation strategies related to this this process need to be reassessed from nonconformances or opportunities for improvement raised?': "No",
+            'have the personnel been verified as competent as a result of this audit?': "Yes"
+        }
+        
+        # Only hardcode TRULY static content that should never change
+        static_sections = {
+            'audit title': "Internal Audit - Customer Feedback Process",
+            'legal requirements': "Nil"
+        }
+        
+        # Dynamic fields - these are the ONLY fields that should change
+        dynamic_fields = {
+            'audit date': datetime.now().strftime("%d/%m/%Y"),
+            'auditor': auditor_name if auditor_name else "Internal Auditor",
+            'audit address': "Remote internal audit"
+        }
+        # Critical fields that MUST be filled from GPT or with a fallback
+        critical_fields = {
+            'audit scope': "This internal audit applies to the implementation of the organisation's Customer Feedback Process at the Osborne Park location",
+            'audit criteria': "ISO 9001:2015:\n\n-   4.2 The needs and expectations of interested parties\n\n-   5.1.2 Customer focus\n\n-   9.1.2 Customer satisfaction\n\nCustomer Feedback Process PAPROC9.0",
+            'audit planning': "Internal Audit Schedule PAFORM25.0",
+            'risks and causes': "Lack of adequate customer feedback causing:\n\n-   Customer dissatisfaction\n\n-   Loss of revenue/opportunities\n\nUnawareness of customer perceptions",
+            'mitigation strategies': "-   Customer Feedback Process in place and implemented to ensure customer feedback occurs and is analysed\n\n-   Quality target in place to ensure regular customer feedback is conducted\n\n-   Management Review Schedule in place and implemented to ensure customer feedback is analysed by management\n\n-   Regular toolbox meetings conducted to ensure customer feedback results are communicated\n\nInternal audits occur to verify the effectiveness and implementation of the Customer Feedback Process"
+        }
+    
+        # Fill all tables - prioritize static content preservation
+        # logger.info(f"Doc: {[[[cell.text for cell in row.cells] for row in table.rows] for table in doc.tables]}")
+        for i, table in enumerate(doc.tables):
+            # Skip very small tables
+            if len(table.rows) < 2:
+                continue
+                    
+            # Process each row
+            for row in table.rows:
+                if len(row.cells) >= 2:
+                    label_cell = row.cells[0]
+                    value_cell = row.cells[1]
+                    label_text = label_cell.text.strip().lower()
+                    
+                    # Check priority 1: Static sections that never change
+                    if label_text in static_sections:
+                        value_cell.text = static_sections[label_text]
+                        continue
+                    
+                    # Check priority 2: Dynamic fields
+                    if label_text in dynamic_fields:
+                        value_cell.text = dynamic_fields[label_text]
+                        continue
+                    
+                    # Check priority 3: Special fields
+                    if label_text in special_fields and special_fields[label_text]:
+                        value_cell.text = special_fields[label_text]
+                        continue
+                    
+                    # Priority 4: Get content from GPT for all other fields, including
+                    # audit criteria, risks & causes, etc.
+                    content_found = False
+                    for header, content in content_sections['headers'].items():
+                        if header.lower() in label_text or label_text in header.lower():
+                            value_cell.text = content
+                            content_found = True
+                            break
+                    
+                    if not content_found and label_text in critical_fields:
+                        value_cell.text = critical_fields[label_text]
+
+                elif len(row.cells) == 1:
+                    # Handle single cell rows which might contain special fields
+                    cell_text = row.cells[0].text.strip().lower()
+                    
+                    # Check if this single cell contains one of our special fields
+                    for field, value in special_fields.items():
+                        if field in cell_text and not row.cells[0].text.endswith(value or ""):
+                            # Append the value to the existing text
+                            if value:
+                                row.cells[0].text = row.cells[0].text + " " + value
+        
+        # Process process-evidence tables
+        evidence_table = None
+        for table in doc.tables:
+            if len(table.rows) > 0 and len(table.rows[0].cells) > 4:  # Typical evidence table has multiple columns
+                header_row = table.rows[0]
+                header_texts = [cell.text.strip().lower() for cell in header_row.cells]
+                
+                # Look for a table with PROCESS and EVIDENCE columns
+                if "process" in header_texts[0] and any("evidence" in text for text in header_texts):
+                    evidence_table = table
+                    break
+        
+        # If we found the evidence table, clean up any [EMPTY] rows and handle duplicates
+        # If we found the evidence table, clean up any duplicates
+        if evidence_table and len(evidence_table.rows) > 1:
+            # Track which processes we've already handled
+            processed_processes = set()
+            # processed_evidence = set()
+            
+            # First pass: identify unique rows
+            valid_rows = []
+            # for row_idx in range(1, len(evidence_table.rows)):
+            #     row = evidence_table.rows[row_idx]
+            #     if len(row.cells) > 1:
+            #         process_cell = row.cells[0]
+            #         evidence_cell = row.cells[1]
+            #         process_text = process_cell.text.strip()
+            #         evidence_text = evidence_cell.text.strip()
+                    
+            #         # Generate a unique key for this evidence
+            #         evidence_key = f"{process_text}_{evidence_text[:50]}"
+                    
+            #         # If not empty and not a duplicate, mark as valid
+            #         if (process_text and process_text != "[EMPTY]" and 
+            #             evidence_key not in processed_evidence):
+            #             valid_rows.append(row_idx)
+            #             processed_evidence.add(evidence_key)
+            
+            # Second pass: Clear all rows not marked as valid
+            # Check each row (skip header)
+            for row_idx in range(1, len(evidence_table.rows)):
+                row = evidence_table.rows[row_idx]
+                if len(row.cells) > 0:
+                    process_cell = row.cells[0]
+                    process_text = process_cell.text.strip()
+                    
+                    
+                    # If this is an empty/duplicate process or labeled as [EMPTY], clear it
+                    if (not process_text or process_text == "[EMPTY]" or 
+                        process_text.lower() in processed_processes or 
+                        process_text.lower() in ["[empty]", "empty"]):
+                        
+                        # Clear all cells in this row
+                        for cell in row.cells:
+                            cell.text = ""
+                    else:
+                        # Add to processed set - use lowercase for case-insensitive comparison
+                        processed_processes.add(process_text.lower())
+            for row_idx in range(1, len(evidence_table.rows)):
+                if row_idx not in valid_rows:
+                    for cell in evidence_table.rows[row_idx].cells:
+                        cell.text = ""
+            
+        
+        # Handle the NONCONFORMANCES table specially
+        nonconformances_table = None
+        for table in doc.tables:
+            if len(table.rows) > 0 and len(table.rows[0].cells) > 0:
+                if "nonconformances" in table.rows[0].cells[0].text.strip().lower():
+                    nonconformances_table = table
+                    break
+        
+        # If found, ensure it's properly filled
+        if nonconformances_table:
+            # First check if we have NC items from the processor
+            nonconformances_found = False
+            nc_items = []
+            
+            # Check if the preprocessor has detected NC
+            if self.preprocessor and hasattr(self.preprocessor, 'score_data'):
+                for file_name, score_info in self.preprocessor.score_data.items():
+                    if score_info.get('category') == 'NC':
+                        nonconformances_found = True
+                        nc_items.append(file_name)
+            
+            # Update the table header row answer cell
+            if len(nonconformances_table.rows) > 0 and len(nonconformances_table.rows[0].cells) > 1:
+                nonconformances_table.rows[0].cells[1].text = "Yes" if nonconformances_found else "Nil"
+        
+        # For the final comments section
+        for table in doc.tables:
+            for row_index, row in enumerate(table.rows):
+                for cell_idx, cell in enumerate(row.cells):
+                    logger.info(f'Row{row_idx} Cell: {cell_idx} -->{row.cells[cell_idx].text}')
+                    if "audit report final comments" in cell.text.strip().lower() and cell_idx + 1 < len(row.cells):
+                        # This is the final comments row
+                        comments_cell = row.cells[cell_idx + 1]
+                        logger.info(f'final part comments: {comments_cell.text} {row.cells[cell_idx].text}')
+                        # Replace placeholders with actual values
+                        comments_text = comments_cell.text
+                        comments_text = comments_text.replace("[NAME OF AUDITOR]", auditor_name if auditor_name else "Internal Auditor")
+                        comments_text = comments_text.replace("[CURRENT DATE]", datetime.now().strftime("%d/%m/%Y"))
+                        comments_cell.text = comments_text
+                        
+                        # If the cell is mostly empty, set standard content
+                        if len(comments_text.strip()) < 10:  # Likely just placeholders
+                            comments_cell.text = (
+                                f"This internal audit was conducted to assess compliance with ISO 9001:2015 requirements "
+                                f"regarding customer feedback processes. The audit found overall compliance with some "
+                                f"opportunities for improvement in delivery notification systems.\n\n"
+                                f"{auditor_name if auditor_name else 'Internal Auditor'}\n"
+                                f"Internal Auditor\n"
+                                f"{datetime.now().strftime('%d/%m/%Y')}"
+                            )
+        
+        # Final pass - explicitly handle sections for nonconformances and opportunities for improvement
+        nonconformances_found = False
+        opportunities_found = False
+        
+        # Check if the preprocessor has detected NC or OFI
+        if self.preprocessor and hasattr(self.preprocessor, 'score_data'):
+            for file_name, score_info in self.preprocessor.score_data.items():
+                logger.info(f'score info: {score_info}')
+                if score_info.get('category') == 'NC':
+                    nonconformances_found = True
+                elif score_info.get('category') == 'OFI':
+                    opportunities_found = True
+        
+        # Update corresponding sections based on findings
+        for table in doc.tables:
+            for row in table.rows:
+                for cell_idx, cell in enumerate(row.cells):
+                    cell_text = cell.text.strip().upper()
+                    # logger.info(f"Testing:{cell_text}")
+                    if "NONCONFORMANCES" in cell_text and cell_idx + 1 < len(row.cells):
+                        row.cells[cell_idx + 1].text = "Yes" if nonconformances_found else "Nilxxxx"
+                    if "OPPORTUNITIES FOR IMPROVEMENTS" in cell_text and cell_idx + 1 < len(row.cells):
+                        row.cells[cell_idx + 1].text = "Yes" if opportunities_found else "Nilyyyy"
+        
+        for table in doc.tables:
+            if len(table.rows) > 1:  # Skip single-row tables
+                # Check if this is a table that should use "Nil" for empty entries
+                # Usually these are result tables with headers like "NONCONFORMANCES", etc.
+                has_nonconformances = False
+                has_opportunities = False
+                
+                # Check the first few rows for these headers
+                for i in range(min(3, len(table.rows))):
+                    if len(table.rows[i].cells) > 0:
+                        cell_text = table.rows[i].cells[0].text.strip().lower()
+                        if "nonconformance" in cell_text:
+                            has_nonconformances = True
+                        if "opportunities for improvement" in cell_text:
+                            has_opportunities = True
+                
+                # If this appears to be a results table
+                if has_nonconformances or has_opportunities:
+                    # Process all cells in this table
+                    for row in table.rows:
+                        for cell in row.cells:
+                            cell_text = cell.text.strip()
+                            # Replace empty values, [EMPTY], or similar placeholders with "Nil"
+                            if (not cell_text or 
+                                cell_text.lower() in ["[empty]", "empty"] or
+                                cell_text == "[]" or
+                                cell_text == "-"):
+                                cell.text = "Nil"
+    
+    def _extract_image_text_content(self):
+        """Extract text content from evidence images using GPT-4o Vision."""
+        extracted_contents = {}
+        
+        try:
+            import openai
+            client = openai.OpenAI(api_key=self.openai_api_key)
+            
+            for evidence_file, images in self.evidence_images.items():
+                if not images:
+                    continue
+                    
+                try:
+                    # Use first image
+                    img_data = images[0]
+                    
+                    # Convert to Base64
+                    import base64
+                    base64_image = base64.b64encode(img_data['data']).decode('utf-8')
+                    
+                    # Create prompt for GPT-4o Vision
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": """You are an expert at extracting customer feedback data from ISO audit images. 
+                            Extract ONLY the following key fields in this EXACT format:
+                            
+                            **Customer:** [Customer Name]
+                            **Date:** [Date in DD/MM/YYYY format]
+                            **Score:** [Total Score, format as X/Y]  
+                            **Comments:** [Brief summary of key comments]
+                            
+                            If you cannot find one of these fields, leave it blank but maintain the format.
+                            Be concise and precise."""
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": f"Extract the customer feedback data from this image."
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/{img_data.get('format', 'png')};base64,{base64_image}"
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                    
+                    # Call the API
+                    response = client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=messages,
+                        max_tokens=500
+                    )
+                    
+                    # Extract the content
+                    extracted_text = response.choices[0].message.content
+                    extracted_contents[evidence_file] = extracted_text
+                    logger.info(f"Successfully extracted text from {os.path.basename(evidence_file)}")
+                    
+                except Exception as e:
+                    logger.error(f"Error extracting from {evidence_file}: {str(e)}")
+                    
+        except Exception as e:
+            logger.error(f"Error setting up image extraction: {str(e)}")
+            
+        return extracted_contents
+    
+    def _insert_evidence_images_with_scoring(self, doc, score_data=None):
+        """Insert evidence images with proper scoring and checkmark placement."""
+        if not self.evidence_images:
+            logger.warning("No evidence images available")
+            return
+        
+        # Create a temp directory for images
+        self.report_images_dir = os.path.join(tempfile.gettempdir(), f"report_images_{int(time.time())}")
+        os.makedirs(self.report_images_dir, exist_ok=True)
+        
+        # Store image paths to prevent garbage collection
+        self.image_paths = []
+        
+        # Track which evidence has been used
+        used_evidence = set()
+        
+        # Extract text from images if API key available
+        image_text = {}
+        if self.openai_api_key:
+            image_text = self._extract_image_text_content()
+            scores = {}
+            # scores = {company: int(re.search(r'\*\*Score:\*\* (\d+)/\d+', text).group(1)) for company, text in image_text.items()}
+            if isinstance(image_text, dict):
+                # Check if any value contains digits
+                if any(re.search(r'\d+', val) for val in image_text.values()):
+                    # Extract scores where possible
+                    scores = {
+                        company: int(re.search(r'\*\*Score:\*\* (\d+)/\d+', text).group(1))
+                        for company, text in image_text.items()
+                        if re.search(r'\*\*Score:\*\* (\d+)/\d+', text)
+                    }
+                else:
+                    scores = {}
+        
+        # Look for the main process-evidence table
+        count = 0
+        for table in doc.tables:
+            count += 1
+            # Skip tables with less than 2 rows
+            if len(table.rows) < 2:
+                continue
+
+            print(f'Total tables: {count}')
+            
+            # Check if this is the process-evidence table
+            header_row = table.rows[0]
+            process_col_idx = -1
+            evidence_col_idx = -1
+            ok_col_idx = -1
+            ofi_col_idx = -1
+            nc_col_idx = -1
+            na_col_idx = -1
+            comments_col_idx = -1
+            
+            # Find column indices
+            for idx, cell in enumerate(header_row.cells):
+                cell_text = cell.text.strip().lower()
+                if "process" in cell_text:
+                    process_col_idx = idx
+                elif "sighted evidence" in cell_text:
+                    evidence_col_idx = idx
+                elif cell_text == "ok":
+                    ok_col_idx = idx
+                elif cell_text == "ofi":
+                    ofi_col_idx = idx
+                elif cell_text == "nc":
+                    nc_col_idx = idx
+                elif cell_text == "na":
+                    na_col_idx = idx
+                elif "additional comments" in cell_text:
+                    comments_col_idx = idx
+            
+            # If we found the process-evidence table
+            if process_col_idx >= 0 and evidence_col_idx >= 0:
+                logger.info(f"Found process-evidence table with {len(table.rows)-1} rows")
+                
+                # Get evidence files
+                evidence_files = list(self.evidence_images.keys())
+                logger.info(f"evidence files I: {evidence_files}")
+
+                if not evidence_files:
+                    continue
+                    
+                # Process each row (skip header)
+                for row_idx, row in enumerate(table.rows[1:], 1):
+                    # logger.info(f"row:{row_idx} data:{row}")
+                    # Skip rows without enough cells
+                    if len(row.cells) <= max(process_col_idx, evidence_col_idx):
+                        continue
+                    
+                    process_cell = row.cells[process_col_idx]
+                    evidence_cell = row.cells[evidence_col_idx]
+                    
+                    # Find matched evidence file
+                    # for file in evidence_files:
+
+                    matched_file = self._match_evidence_to_process(
+                        process_cell.text.strip(),
+                        evidence_files,
+                        used_evidence
+                    )
+                    
+                    if matched_file:
+                        # continue
+                        
+                        # Mark as used
+                        used_evidence.add(matched_file)
+                        base_name = os.path.basename(matched_file).split('.')[0]
+                        process_name = ' '.join(word.capitalize() for word in base_name.replace('_', ' ').replace('-', ' ').split())
+                        # logger.info(f"process before check: {process_name}")
+
+                        if not process_name in self.process_list:
+                            # logger.info(f"process:{process_name}")
+                            self.process_list.append(process_name)
+                    
+                            # Add image to evidence cell
+                            self._add_image_to_cell(evidence_cell, matched_file)
+                            
+                            # Add metadata to process cell
+                            self._add_metadata_to_process_cell(process_cell, matched_file, image_text)
+                        
+                        # Determine category (OK, OFI, NC, NA) based on score analysis
+                        # key = list(scores.keys())[row_idx-1]
+                        # logger.info(f"{scores[matched_file]}")
+                            category, comment = self._determine_category(matched_file,[scores.get(matched_file)])
+                            
+                            # Add checkmark with background color
+                            self._add_checkmark_with_background(
+                                row, ok_col_idx, ofi_col_idx, nc_col_idx, na_col_idx, comments_col_idx, 
+                                category, comment
+                            )
+                logger.info(f"processes: {self.process_list}")
+    
+    def _match_evidence_to_process(self, process_text, evidence_files, used_evidence):
+        """Find the most relevant evidence file for a process."""
+        # Extract keywords from process text
+        # logger.info(f"evidence files II: {evidence_files}")
+
+        process_keywords = set(process_text.lower().replace('.', ' ').replace('_', ' ').replace('-', ' ').split())
+        
+        # First try: Look for exact matches
+        for file in evidence_files:
+            if file in used_evidence:
+                continue
+                
+            file_base = os.path.basename(file).lower()
+            file_keywords = set(file_base.replace('.', ' ').replace('_', ' ').replace('-', ' ').split())
+            
+            # Check for keyword overlap
+            overlap = process_keywords.intersection(file_keywords)
+            if len(overlap) >= 1 or any(keyword in process_text.lower() for keyword in file_keywords):
+                return file
+        
+        # Second try: Look for related terms
+        related_terms = {
+            'customer': ['feedback', 'satisfaction', 'survey', 'client'],
+            'compliance': ['audit', 'assessment', 'review', 'check'],
+            'management': ['review', 'meeting', 'minutes', 'report'],
+        }
+        
+        for file in evidence_files:
+            if file in used_evidence:
+                continue
+                
+            file_base = os.path.basename(file).lower()
+            
+            for key, terms in related_terms.items():
+                if key in process_text.lower() or any(term in process_text.lower() for term in terms):
+                    if key in file_base or any(term in file_base for term in terms):
+                        return file
+        
+        # Final try: Just use any unused file
+        for file in evidence_files:
+            if file not in used_evidence:
+                # logger.info(f"unused file: {file}")
+                return file
+        
+        # If all files used, return the first one (cyclic reuse)
+        return evidence_files[0] if evidence_files else None
+    
+    def _add_image_to_cell(self, cell, file_name):
+        """Add an evidence image to a table cell."""
+        # Clear any existing content
+        cell.text = ""
+        
+        # Get image from the file
+        if not self.evidence_images[file_name]:
+            cell.text = f"No image available for {file_name}"
+            return
+            
+        img_data = self.evidence_images[file_name][0]
+        
+        try:
+            # Create image file
+            ext = img_data.get('format', 'png').lower()
+            image_filename = f"evidence_{os.path.basename(file_name)}.{ext}"
+            image_path = os.path.join(self.report_images_dir, image_filename)
+            
+            # Write image to file
+            with open(image_path, 'wb') as img_file:
+                img_file.write(img_data['data'])
+            
+            # Save path to prevent garbage collection
+            self.image_paths.append(image_path)
+            
+            # Add image to cell
+            paragraph = cell.add_paragraph()
+            run = paragraph.add_run()
+            
+            # Set consistent size for better PDF conversion
+            width_inches = 2.0
+            height_inches = 1.5
+            width_emu = int(width_inches * 914400)  # 1 inch = 914400 EMUs
+            height_emu = int(height_inches * 914400)
+            
+            # Add image
+            run.add_picture(image_path, width=width_emu, height=height_emu)
+            
+            # Add caption
+            caption = cell.add_paragraph()
+            caption_run = caption.add_run(f"Evidence: {os.path.basename(file_name)}")
+            caption_run.font.size = Pt(8)
+            
+        except Exception as e:
+            logger.error(f"Error adding image: {str(e)}")
+            cell.text = f"Error loading image: {str(e)}"
+    
+    def _add_metadata_to_process_cell(self, cell, file_name, image_text):
+        """Add extracted metadata to the process cell."""
+        # Get existing text
+        existing_text = cell.text.strip()
+        
+        # Start with file name as process name if cell is empty
+        # process_list = []
+        if not existing_text:
+            base_name = os.path.basename(file_name).split('.')[0]
+            process_name = ' '.join(word.capitalize() for word in base_name.replace('_', ' ').replace('-', ' ').split())
+            existing_text = f"Process: {process_name}"
+            # if not process_name in process_list:
+            #     # logger.info(f"process:{process_name}")
+            #     process_list.append(process_name)
+                
+            # Get metadata for this file
+            metadata = self.evidence_metadata.get(file_name, {})
+            extracted_text = image_text.get(file_name, "")
+            
+            # Create metadata text
+            metadata_lines = []
+            
+            # Add extracted text if available
+            if extracted_text:
+                metadata_lines.append("Evidence Data:")
+                metadata_lines.append(extracted_text)
+            else:
+                # Otherwise use metadata
+                metadata_lines.append("Evidence Details:")
+                
+                if 'companies' in metadata and metadata['companies']:
+                    metadata_lines.append(f"Customer: {metadata['companies'][0]}")
+                
+                if 'dates' in metadata and metadata['dates']:
+                    metadata_lines.append(f"Date: {metadata['dates'][0]}")
+                
+                if 'scores' in metadata and metadata['scores']:
+                    metadata_lines.append(f"Score: {metadata['scores'][0]}")
+            
+            # Add metadata to cell if we have any
+            if metadata_lines:
+                if existing_text:
+                    new_text = f"{existing_text}\n\n{chr(10).join(metadata_lines)}"
+                else:
+                    new_text = chr(10).join(metadata_lines)
+                
+                # Update cell text
+                cell.text = new_text
+            # logger.info(f"PROCESSES: {self.process_list}")
+            
+    
+    def _determine_category(self, file_name, score_data=None):
+        # logger.info(f"score data: {score_data}")
+        """Determine category (OK, OFI, NC, NA) based on score information."""
+        # Use preprocessor score data if available
+        # if score_data and file_name in score_data:
+        #     print(score_data[file_name]['category'], score_data[file_name].get('comment', ''))
+        #     return score_data[file_name]['category'], score_data[file_name].get('comment', '')
+        
+        # Default to OK for Excel files, otherwise analyze
+        if file_name.lower().endswith(('.xlsx', '.xls')):
+            return 'OK', ""
+        
+        # Get metadata
+        metadata = self.evidence_metadata.get(file_name, {})
+        # logger.info(f'metadata: {metadata}')
+        
+        # No metadata - default to OK
+        # if not metadata or not metadata.get('scores'):
+        #     return 'OK', ""
+        
+        # Check scores
+        for score in score_data:
+            # Format X/Y (e.g. 20/25)
+            score = f'{score}/25'
+            if '/' in score:
+                # logger.info(f'score: {score}')
+                try:
+                    parts = score.split('/')
+                    numerator = float(parts[0].strip())
+                    denominator = float(parts[1].strip())
+                    percentage = (numerator / denominator) * 100
+                    # logger.info(f'percentage: {percentage}')
+
+                    
+                    if percentage >= 90:
+                        return 'OK', ""
+                    elif percentage >= 80:
+                        return 'OK', ""
+                    elif percentage >= 70:
+                        return 'OFI', f"Score of {score} indicates room for improvement in customer satisfaction. Consider implementing additional feedback mechanisms."
+                    else:
+                        return 'NC', f"Low score of {score} represents a significant gap in customer satisfaction requiring immediate corrective action."
+                except:
+                    pass
+            
+            # Direct numeric score
+            elif score.replace('.', '', 1).isdigit():
+                try:
+                    value = float(score)
+                    
+                    # Different logic based on scale
+                    if value <= 10:  # Likely 0-10 scale
+                        if value >= 8.5:
+                            return 'OK', ""
+                        elif value >= 7:
+                            return 'OFI', f"Rating of {value}/10 suggests areas for service improvement."
+                        else:
+                            return 'NC', f"Rating of {value}/10 indicates significant customer dissatisfaction requiring immediate action."
+                    
+                    elif value <= 100:  # Likely percentage
+                        if value >= 85:
+                            return 'OK', ""
+                        elif value >= 70:
+                            return 'OFI', f"Satisfaction score of {value}% shows moderate customer satisfaction. Implement targeted improvements."
+                        else:
+                            return 'NC', f"Satisfaction score of {value}% indicates poor customer experience. Process review required."
+                except:
+                    pass
+        
+        # Default to OK if no score triggered a different category
+        return 'OK', ""
+    
+    def _add_checkmark_with_background(self, row, ok_col_idx, ofi_col_idx, nc_col_idx, na_col_idx, comments_col_idx, category, comment):
+        """Add a checkmark to the appropriate cell with background color."""
+        # Define colors for different columns
+        colors = {
+            'OK': "92D050",  # Light green
+            'OFI': "8DB3E2",  # Light blue
+            'NC': "FF0000",   # Red
+            'NA': "FFFFFF"    # White (default)
+        }
+        
+        # Clear all checkmark cells first
+        if ok_col_idx >= 0 and ok_col_idx < len(row.cells):
+            row.cells[ok_col_idx].text = ""
+        if ofi_col_idx >= 0 and ofi_col_idx < len(row.cells):
+            row.cells[ofi_col_idx].text = ""
+        if nc_col_idx >= 0 and nc_col_idx < len(row.cells):
+            row.cells[nc_col_idx].text = ""
+        if na_col_idx >= 0 and na_col_idx < len(row.cells):
+            row.cells[na_col_idx].text = ""
+        
+        # Add checkmark to appropriate cell
+        target_cell = None
+        if category == 'OK' and ok_col_idx >= 0 and ok_col_idx < len(row.cells):
+            target_cell = row.cells[ok_col_idx]
+        elif category == 'OFI' and ofi_col_idx >= 0 and ofi_col_idx < len(row.cells):
+            target_cell = row.cells[ofi_col_idx]
+        elif category == 'NC' and nc_col_idx >= 0 and nc_col_idx < len(row.cells):
+            target_cell = row.cells[nc_col_idx]
+        elif category == 'NA' and na_col_idx >= 0 and na_col_idx < len(row.cells):
+            target_cell = row.cells[na_col_idx]
+        
+        # Add checkmark and background color if we have a target cell
+        if target_cell:
+            # Add checkmark
+            target_cell.text = "✓"
+            
+            # Set background color
+            color = colors.get(category, "FFFFFF")
+            
+            try:
+                # Set cell background color
+                tcPr = target_cell._element.get_or_add_tcPr()
+                shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{color}"/>')
+                
+                # Remove existing shading if present
+                for old_shading in tcPr.findall('.//w:shd', namespaces=tcPr.nsmap):
+                    tcPr.remove(old_shading)
+                
+                # Add new shading
+                tcPr.append(shading)
+                
+                # Center the checkmark
+                for paragraph in target_cell.paragraphs:
+                    paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+            except Exception as e:
+                logger.warning(f"Failed to set background color: {str(e)}")
+        
+        # Add comment if needed
+        if comment and comments_col_idx >= 0 and comments_col_idx < len(row.cells) and category in ['OFI', 'NC']:
+            row.cells[comments_col_idx].text = comment
+    
+    def save_report(self, doc, output_path, convert_to_pdf=True):
+        """Save the document to the specified path and optionally convert to PDF."""
+        try:
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            
+            # Determine file paths
+            base_path = output_path.rsplit('.', 1)[0] if '.' in output_path else output_path
+            docx_path = f"{base_path}.docx"
+            pdf_path = f"{base_path}.pdf" if convert_to_pdf else None
+            
+            # Save the DOCX file
+            doc.save(docx_path)
+            logger.info(f"Report saved to {docx_path}")
+            
+            # Convert to PDF if requested
+            if convert_to_pdf:
+                pdf_success = self._convert_to_pdf(docx_path, pdf_path)
+                
+                if pdf_success:
+                    logger.info(f"PDF created at {pdf_path}")
+                    return True
+                else:
+                    logger.error("Failed to create PDF")
+                    return False
+            
+            return True
+        
+        except Exception as e:
+            logger.error(f"Error saving report: {str(e)}")
+            return False
+    
+    def _convert_to_pdf(self, docx_path, pdf_path):
+        """Convert DOCX to PDF using available methods."""
+        # Method 1: Try with win32com (Windows only)
+        try:
+            import win32com.client
+            pythoncom.CoInitialize()
+            
+            # Initialize Word
+            word = win32com.client.Dispatch("Word.Application")
+            word.Visible = False
+            
+            try:
+                # Open document and save as PDF
+                doc = word.Documents.Open(os.path.abspath(docx_path))
+                doc.SaveAs(os.path.abspath(pdf_path), FileFormat=17)  # 17 = PDF
+                doc.Close()
+                word.Quit()
+                
+                if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
+                    return True
+            finally:
+                try:
+                    word.Quit()
+                except:
+                    pass
+                pythoncom.CoUninitialize()
+                
+        except Exception as e:
+            logger.warning(f"Error using win32com for PDF conversion: {str(e)}")
+        
+        # Method 2: Try with docx2pdf if available
+        try:
+            from docx2pdf import convert
+            convert(docx_path, pdf_path)
+            if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
+                return True
+        except ImportError:
+            logger.info("docx2pdf not available")
+        except Exception as e:
+            logger.warning(f"Error using docx2pdf: {str(e)}")
+        
+        # No methods succeeded
+        return False
