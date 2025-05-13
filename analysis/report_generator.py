@@ -272,17 +272,15 @@ class ReportGenerator:
         nc_ofi_comments = self._fill_evidence_table(evidence_table, consolidated_content)
         
         # 4. Update footer content with collected NC/OFI comments
-        if nc_ofi_comments['NC'] and 'NONCONFORMANCES' in footer_content:
-            if footer_content['NONCONFORMANCES'] == 'Nil':
-                footer_content['NONCONFORMANCES'] = "\n".join(nc_ofi_comments['NC'])
-            else:
-                footer_content['NONCONFORMANCES'] += "\n" + "\n".join(nc_ofi_comments['NC'])
+        if nc_ofi_comments['NC']:
+            footer_content['NONCONFORMANCES'] = "\n".join(nc_ofi_comments['NC'])
+        else:
+            footer_content['NONCONFORMANCES'] = 'Nil'
                 
-        if nc_ofi_comments['OFI'] and 'OPPORTUNITIES FOR IMPROVEMENTS' in footer_content:
-            if footer_content['OPPORTUNITIES FOR IMPROVEMENTS'] == 'Nil':
-                footer_content['OPPORTUNITIES FOR IMPROVEMENTS'] = "\n".join(nc_ofi_comments['OFI'])
-            else:
-                footer_content['OPPORTUNITIES FOR IMPROVEMENTS'] += "\n" + "\n".join(nc_ofi_comments['OFI'])
+        if nc_ofi_comments['OFI']:
+            footer_content['OPPORTUNITIES FOR IMPROVEMENTS'] = "\n".join(nc_ofi_comments['OFI'])
+        else:
+            footer_content['OPPORTUNITIES FOR IMPROVEMENTS'] = 'Nil'
         
         # 5. Fill the findings table
         self._fill_findings_table(findings_table, footer_content, auditor_name)
@@ -490,17 +488,21 @@ class ReportGenerator:
         
         # Fill in OK/OFI/NC/NA cells from entry data if not already done
         for i, col in enumerate(['OK', 'OFI', 'NC', 'NA']):
-            if col in entry and entry[col] and not row.cells[2 + i].text.strip():
-                row.cells[2 + i].text = entry[col]
+            cell_idx = 2 + i
+            if col in entry and entry[col] and not row.cells[cell_idx].text.strip():
+                row.cells[cell_idx].text = entry[col]
                 
-                # If we have checkmarks in OFI or NC columns and no comments recorded yet,
-                # check for additional comments
-                if (col == 'NC' or col == 'OFI') and entry[col] == '✓' and not comments[col]:
+                # If we have checkmarks in OFI or NC columns, collect the additional comments
+                if entry[col] == '✓' and (col == 'NC' or col == 'OFI'):
+                    # Check if there are additional comments
                     if 'ADDITIONAL COMMENTS' in entry and entry['ADDITIONAL COMMENTS']:
                         comments[col] = entry['ADDITIONAL COMMENTS']
+                        # Also add the comments to the comments cell
+                        if not row.cells[6].text.strip():
+                            row.cells[6].text = entry['ADDITIONAL COMMENTS']
         
-        # Only add comments to the row for NC or OFI
-        if ('NC' in entry and entry['NC']) or ('OFI' in entry and entry['OFI']):
+        # Only add comments to the row for NC or OFI if not already added
+        if ('NC' in entry and entry['NC'] == '✓' or 'OFI' in entry and entry['OFI'] == '✓'):
             if 'ADDITIONAL COMMENTS' in entry and entry['ADDITIONAL COMMENTS'] and not row.cells[6].text.strip():
                 row.cells[6].text = entry['ADDITIONAL COMMENTS']
         
@@ -513,11 +515,16 @@ class ReportGenerator:
         cell.text = ""
         
         # Get image from the file
-        if not self.evidence_images.get(file_name):
+        if file_name not in self.evidence_images:
             cell.text = f"No image available for {file_name}"
             return
             
-        img_data = self.evidence_images[file_name][0]
+        img_data_list = self.evidence_images[file_name]
+        if not img_data_list:
+            cell.text = f"No image data available for {file_name}"
+            return
+        
+        img_data = img_data_list[0]  # Use the first image in the list
         
         try:
             # Create image file
